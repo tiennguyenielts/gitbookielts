@@ -11,6 +11,8 @@ export const runtime = 'edge';
  */
 export async function GET(request: NextRequest) {
     const url = request.nextUrl.searchParams.get('url');
+    console.log(request.url);
+    console.log(url);
     const signature = request.nextUrl.searchParams.get('sign');
     if (!url || !signature) {
         return new Response('Missing url/sign parameters', { status: 400 });
@@ -24,7 +26,7 @@ export async function GET(request: NextRequest) {
     // Verify the signature
     const verified = await verifyImageSignature(url, signature);
     if (!verified) {
-        return new Response(`Invalid signature "${signature ?? ''}" for "${url}"`, { status: 400 });
+        return new Response(`Invalid signature "${signature ?? ''}" for "${url}" (${request.url})`, { status: 400 });
     }
 
     // Cloudflare-specific options are in the cf object.
