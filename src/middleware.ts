@@ -1,6 +1,7 @@
 import { GitBookAPI } from '@gitbook/api';
 import * as Sentry from '@sentry/nextjs';
 import assertNever from 'assert-never';
+import jwt from 'jsonwebtoken';
 import type { ResponseCookie } from 'next/dist/compiled/@edge-runtime/cookies';
 import { NextResponse, NextRequest } from 'next/server';
 
@@ -14,13 +15,14 @@ import {
     withAPI,
     getSpaceLayoutData,
     DEFAULT_API_ENDPOINT,
-    getSiteSpaceLayoutData,
+    getCurrentSiteLayoutData,
 } from '@/lib/api';
 import { race } from '@/lib/async';
 import { buildVersion } from '@/lib/build';
 import { createContentSecurityPolicyNonce, getContentSecurityPolicy } from '@/lib/csp';
 import { getURLLookupAlternatives, normalizeURL } from '@/lib/middleware';
 import {
+    VisitorAuthCookieValue,
     getVisitorAuthCookieName,
     getVisitorAuthCookieValue,
     getVisitorAuthToken,
@@ -72,6 +74,14 @@ export type LookupResult = PublishedContentWithCache & {
     /** Cookies to store on the response */
     cookies?: LookupCookies;
 };
+
+interface ContentAPITokenPayload {
+    organization: string;
+    spaces: string[];
+    collection?: string;
+    site?: string;
+    siteSpace?: string;
+}
 
 /**
  * Middleware to lookup the space to render.
@@ -170,11 +180,10 @@ export async function middleware(request: NextRequest) {
             );
 
             const { scripts } = await ('site' in resolved
-                ? getSiteSpaceLayoutData({
+                ? getCurrentSiteLayoutData({
                       organizationId: resolved.organization,
                       siteId: resolved.site,
                       siteSpaceId: resolved.siteSpace,
-                      spaceId: resolved.space,
                   })
                 : getSpaceLayoutData(resolved.space));
             return getContentSecurityPolicy(scripts, nonce);
@@ -196,7 +205,9 @@ export async function middleware(request: NextRequest) {
     if ('site' in resolved) {
         headers.set('x-gitbook-content-organization', resolved.organization);
         headers.set('x-gitbook-content-site', resolved.site);
-        headers.set('x-gitbook-content-site-space', resolved.siteSpace);
+        if (resolved.siteSpace) {
+            headers.set('x-gitbook-content-site-space', resolved.siteSpace);
+        }
     }
     if (resolved.revision) {
         headers.set('x-gitbook-content-revision', resolved.revision);
@@ -475,10 +486,20 @@ async function lookupSpaceInMultiIdMode(request: NextRequest, url: URL): Promise
         };
     }
 
+    const { organization, site, siteSpace } = jwt.decode(apiToken) as ContentAPITokenPayload;
+    const siteLookupResult =
+        typeof organization === 'string' && organization && typeof site === 'string' && site
+            ? {
+                  organization,
+                  site,
+                  ...(typeof siteSpace === 'string' && siteSpace ? { siteSpace } : {}),
+              }
+            : {};
     return {
         space: spaceId,
         changeRequest: changeRequestId,
         revision: revisionId,
+        ...siteLookupResult,
         basePath: normalizePathname(basePathParts.join('/')),
         pathname: normalizePathname(pathSegments.join('/')),
         apiToken,
@@ -568,7 +589,7 @@ async function lookupSpaceInMultiPathMode(request: NextRequest, url: URL): Promi
  */
 async function lookupSpaceByAPI(
     lookupURL: URL,
-    visitorAuthToken: string | undefined,
+    visitorAuthToken: ReturnType<typeof getVisitorAuthToken>,
 ): Promise<LookupResult> {
     const url = stripURLSearch(lookupURL);
     const lookup = getURLLookupAlternatives(url);
@@ -578,9 +599,17 @@ async function lookupSpaceByAPI(
     );
 
     const result = await race(lookup.urls, async (alternative, { signal }) => {
-        const data = await getPublishedContentByUrl(alternative.url, visitorAuthToken, {
-            signal,
-        });
+        const data = await getPublishedContentByUrl(
+            alternative.url,
+            typeof visitorAuthToken === 'undefined'
+                ? undefined
+                : typeof visitorAuthToken === 'string'
+                  ? visitorAuthToken
+                  : visitorAuthToken.token,
+            {
+                signal,
+            },
+        );
 
         if ('error' in data) {
             if (alternative.primary) {
@@ -652,22 +681,36 @@ async function lookupSpaceByAPI(
  */
 function getLookupResultForVisitorAuth(
     basePath: string,
-    visitorAuthToken: string,
+    visitorAuthToken: string | VisitorAuthCookieValue,
 ): Partial<LookupResult> {
     return {
         // No caching for content served with visitor auth
         cacheMaxAge: undefined,
         cacheTags: [],
         cookies: {
-            [getVisitorAuthCookieName(basePath)]: {
-                value: getVisitorAuthCookieValue(basePath, visitorAuthToken),
-                options: {
-                    httpOnly: true,
-                    sameSite: 'none',
-                    secure: process.env.NODE_ENV === 'production',
-                    maxAge: 7 * 24 * 60 * 60,
-                },
-            },
+            /**
+             * If the visitorAuthToken has been retrieved from a cookie, we set it back only
+             * if the basePath matches the current one. This is to avoid setting cookie for
+             * different base paths.
+             */
+            ...(typeof visitorAuthToken === 'string' || visitorAuthToken.basePath === basePath
+                ? {
+                      [getVisitorAuthCookieName(basePath)]: {
+                          value: getVisitorAuthCookieValue(
+                              basePath,
+                              typeof visitorAuthToken === 'string'
+                                  ? visitorAuthToken
+                                  : visitorAuthToken.token,
+                          ),
+                          options: {
+                              httpOnly: true,
+                              sameSite: 'none',
+                              secure: process.env.NODE_ENV === 'production',
+                              maxAge: 7 * 24 * 60 * 60,
+                          },
+                      },
+                  }
+                : {}),
         },
     };
 }
